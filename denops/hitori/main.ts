@@ -5,7 +5,28 @@ import * as buffer from "https://deno.land/x/denops_std@v5.2.0/buffer/mod.ts";
 import { ensure, is } from "https://deno.land/x/unknownutil@v3.11.0/mod.ts";
 import type { Denops } from "https://deno.land/x/denops_std@v5.2.0/mod.ts";
 
-let enable = true;
+let m_enable = true;
+let m_server : Deno.HttpServer;
+let m_sockets : Map<WebSocket,BufnrSocketPair> = new Map<WebSocket,BufnrSocketPair>() ;
+let m_debug = false;
+
+class BufnrSocketPair{
+  bufnr : number;
+  ws : WebSocket;
+
+  constructor(bufnr:number,ws:WebSocket)
+  {
+    this.bufnr = bufnr;
+    this.ws = ws;
+  }
+}
+
+// deno-lint-ignore no-explicit-any
+const clog = (...data: any[]): void => {
+  if (m_debug) {
+    console.log(...data);
+  }
+};
 
 function isListening(port: number): boolean {
   // running check.
@@ -40,13 +61,13 @@ async function wsl2win(denops: Denops, path: string): Promise<string> {
   return path;
 }
 
-export async function main(denops: Denops): Promise<void> {
-  let isListen = false;
+async function serve(denops: Denops) : Promise<boolean>
+{
   const hasWin = await fn.has(denops, "win32");
   const hasWsl = await fn.has(denops, "wsl");
 
   // debug.
-  const debug = await vars.g.get(denops, "hitori_debug", false);
+  m_debug = await vars.g.get(denops, "hitori_debug", false);
   const quit = await vars.g.get(denops, "hitori_quit", true);
   const port = await vars.g.get(denops, "hitori_port", 7070);
   const wsl = await vars.g.get(denops, "hitori_wsl", false);
@@ -56,22 +77,143 @@ export async function main(denops: Denops): Promise<void> {
     "hitori_ignore_patterns",
     ["\\.tmp$", "\\.diff$", "(COMMIT_EDIT|TAG_EDIT|MERGE_|SQUASH_)MSG$"],
   );
-  enable = await vars.g.get(denops, "hitori_enable", true);
+  m_enable = await vars.g.get(denops, "hitori_enable", true);
 
-  // deno-lint-ignore no-explicit-any
-  const clog = (...data: any[]): void => {
-    if (debug) {
-      console.log(...data);
-    }
-  };
+  const isListen = isListening(port);
+  if( isListen )
+  {
+    return false;
+  }
 
-  clog({ debug, port, enable, quit, wsl });
+  m_server = Deno.serve({ port }, (req) => {
+    clog(req);
+    const { response, socket } = Deno.upgradeWebSocket(req);
+    socket.addEventListener("open", () => clog("[server] open !"));
+    socket.addEventListener(
+      "error",
+      (e) => clog(`[server] error !`, e),
+    );
+    socket.addEventListener("close", () => 
+    {
+      clog("[server] close !");
+      m_sockets.delete(socket);
+    });
+    socket.addEventListener(
+      "message",
+      async (e) => {
+        clog(`[server] message ! ${e.data}`);
+
+        let bufPath = e.data;
+
+        // ignore list check.
+        if (ignorePatterns.some((p) => new RegExp(p).test(bufPath))) {
+          clog(`${bufPath} is ignore list pattern ! so open skip !`);
+          socket.send(
+            JSON.stringify({
+              msg: "This data is ignore list patterns !",
+              open: false,
+            }),
+          );
+          return;
+        }
+
+        if (!wsl) {
+          if (hasWin && bufPath[0] === "/") {
+            clog(`${bufPath} is wsl path pattern ! so open skip !`);
+            socket.send(
+              JSON.stringify({
+                msg: "This data is wsl path patterns !",
+                open: false,
+              }),
+            );
+            return;
+          }
+          if (hasWsl && bufPath[0] !== "/") {
+            clog(`${bufPath} is windows path pattern ! so open skip !`);
+            socket.send(
+              JSON.stringify({
+                msg: "This data is windows path patterns !",
+                open: false,
+              }),
+            );
+            return;
+          }
+        }
+        if (!m_enable) {
+          clog(`Disable hitori ...`);
+          socket.send(
+            JSON.stringify({
+              msg: "hitori is disabled !",
+              open: false,
+            }),
+          );
+          return;
+        }
+        if (bufPath) {
+          clog(`open ${bufPath}`);
+          if (wsl) {
+            bufPath = await wsl2win(denops, await win2wsl(denops, bufPath));
+          }
+          buffer.open(denops, bufPath, { opener }).then( async or=>
+          {
+            console.log(`open ${bufPath} bufnr:${or.bufnr}`);
+            m_sockets.set( socket, new BufnrSocketPair(or.bufnr, socket) );
+            await helper.execute(
+              denops,
+              `
+              augroup ${denops.name}_opened_${or.bufnr}
+              au!
+              autocmd BufUnload * if ${or.bufnr} == expand('<abuf>') | call s:${denops.name}_notify('buf_unload', [expand('<abuf>')]) | au!| endif
+              augroup END
+            `,
+            );
+          }).catch(e=>
+          {
+            socket.send(
+              JSON.stringify({
+                msg: "Failed open. reason:" + e,
+                open: true,
+              }),
+            );
+          });
+        } else {
+          clog(`data is null !`);
+          socket.send(
+            JSON.stringify({
+              msg: "Not open !",
+              open: true,
+            }),
+          );
+        }
+      },
+    );
+    return response;
+  });
+  return true;
+}
+
+export async function main(denops: Denops): Promise<void> {
+  let isListen = false;
+
+  // debug.
+  m_debug = await vars.g.get(denops, "hitori_debug", false);
+  const quit = await vars.g.get(denops, "hitori_quit", true);
+  const port = await vars.g.get(denops, "hitori_port", 7070);
+  const wsl = await vars.g.get(denops, "hitori_wsl", false);
+  const ignorePatterns: string[] = await vars.g.get(
+    denops,
+    "hitori_ignore_patterns",
+    ["\\.tmp$", "\\.diff$", "(COMMIT_EDIT|TAG_EDIT|MERGE_|SQUASH_)MSG$"],
+  );
+  m_enable = await vars.g.get(denops, "hitori_enable", true);
+
+  clog({ m_debug, port, m_enable, quit, wsl });
 
   denops.dispatcher = {
     async attach(..._args: unknown[]): Promise<void> {
       try {
         clog(`attach start`);
-        if (!enable) {
+        if (!m_enable) {
           clog(`g:hitori_enable is false !`);
           return;
         }
@@ -121,11 +263,26 @@ export async function main(denops: Denops): Promise<void> {
     },
     // deno-lint-ignore require-await
     async enable(): Promise<void> {
-      enable = true;
+      if( m_enable ){ return; }
+      m_enable = await serve( denops );
     },
     // deno-lint-ignore require-await
     async disable(): Promise<void> {
-      enable = false;
+      if( !m_enable ){ return; }
+      m_server.shutdown();
+      m_enable = false;
+    },
+    async buf_unload(...args: unknown[]): Promise<void> {
+      const bufnr = args[0] as number
+      console.log('unloaded bufnr:' + bufnr);
+      const pair = Array.from<BufnrSocketPair>(m_sockets.values()).find( bwp => bwp.bufnr == bufnr );
+      if( pair === undefined ){ console.log('bufnrs socket is not found : ' + bufnr); return;}
+      pair.ws.send(
+        JSON.stringify({
+          msg: "Success open !",
+          open: true,
+        }),
+      );
     },
   };
 
@@ -146,94 +303,7 @@ export async function main(denops: Denops): Promise<void> {
   try {
     if (isListen) {
       clog(`Server already running.`);
-      await denops.dispatcher.attach();
     } else {
-      Deno.serve({ port }, (req) => {
-        clog(req);
-        const { response, socket } = Deno.upgradeWebSocket(req);
-        socket.addEventListener("open", () => clog("[server] open !"));
-        socket.addEventListener(
-          "error",
-          (e) => clog(`[server] error !`, e),
-        );
-        socket.addEventListener("close", () => clog("[server] close !"));
-        socket.addEventListener(
-          "message",
-          async (e) => {
-            clog(`[server] message ! ${e.data}`);
-
-            let bufPath = e.data;
-
-            // ignore list check.
-            if (ignorePatterns.some((p) => new RegExp(p).test(bufPath))) {
-              clog(`${bufPath} is ignore list pattern ! so open skip !`);
-              socket.send(
-                JSON.stringify({
-                  msg: "This data is ignore list patterns !",
-                  open: false,
-                }),
-              );
-              return;
-            }
-
-            if (!wsl) {
-              if (hasWin && bufPath[0] === "/") {
-                clog(`${bufPath} is wsl path pattern ! so open skip !`);
-                socket.send(
-                  JSON.stringify({
-                    msg: "This data is wsl path patterns !",
-                    open: false,
-                  }),
-                );
-                return;
-              }
-              if (hasWsl && bufPath[0] !== "/") {
-                clog(`${bufPath} is windows path pattern ! so open skip !`);
-                socket.send(
-                  JSON.stringify({
-                    msg: "This data is windows path patterns !",
-                    open: false,
-                  }),
-                );
-                return;
-              }
-            }
-            if (!enable) {
-              clog(`Disable hitori ...`);
-              socket.send(
-                JSON.stringify({
-                  msg: "hitori is disabled !",
-                  open: false,
-                }),
-              );
-              return;
-            }
-            if (bufPath) {
-              clog(`open ${bufPath}`);
-              socket.send(
-                JSON.stringify({
-                  msg: "Success open !",
-                  open: true,
-                }),
-              );
-              if (wsl) {
-                bufPath = await wsl2win(denops, await win2wsl(denops, bufPath));
-              }
-              console.log(`open ${bufPath}`);
-              await buffer.open(denops, bufPath, { opener });
-            } else {
-              clog(`data is null !`);
-              socket.send(
-                JSON.stringify({
-                  msg: "Not open !",
-                  open: true,
-                }),
-              );
-            }
-          },
-        );
-        return response;
-      });
     }
   } catch (e) {
     console.error(e);
@@ -241,3 +311,4 @@ export async function main(denops: Denops): Promise<void> {
 
   clog("dps-hitori has loaded");
 }
+
